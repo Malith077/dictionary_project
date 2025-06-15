@@ -1,0 +1,5 @@
+Flask==2.3.2
+graphene==2.1.9
+pytest==7.4.0
+Flask-GraphQL==2.0.1
+Werkzeug==2.3.8
