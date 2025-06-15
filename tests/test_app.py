@@ -1,11 +1,12 @@
 import pytest
 import json
-from app import app as flask_app  # Import the Flask app instance from app.py
+from project.app import create_app # Import the create_app factory
 
 @pytest.fixture
 def client():
-    flask_app.config['TESTING'] = True
-    with flask_app.test_client() as client:
+    app = create_app()
+    app.config['TESTING'] = True
+    with app.test_client() as client:
         yield client
 
 def test_graphql_hello_query(client):
