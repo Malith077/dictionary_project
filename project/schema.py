@@ -5,23 +5,15 @@ from .db import get_collection # Import MongoDB helper
 
 # --- Graphene Type Definitions with MongoDB Resolvers ---
 
-# Helper function to map MongoDB '_id' to 'id' if needed,
-# and convert ObjectId to string if _id is ObjectId.
-# For now, we assume 'id' is already a string field in the DB matching GraphQL ID.
-# If _id is the primary key and is a string, this can be simpler.
-# If _id is ObjectId, it MUST be converted to string for Graphene ID type.
 def map_document_id(doc):
-    if doc and '_id' in doc:
-        # If _id is an ObjectId, convert to string and map to 'id'
-        # from bson import ObjectId
-        # if isinstance(doc['_id'], ObjectId):
-        #     doc['id'] = str(doc['_id'])
-        # elif not 'id' in doc: # if _id is string, and no 'id' field, map it
-        #     doc['id'] = doc['_id']
-        # For this pass, we assume 'id' field exists and is the correct string type.
-        # If your DB uses string _id directly, you might not need 'id' field separately.
-        # Let's assume documents have an 'id' field that matches the GraphQL ID.
-        pass # No explicit mapping if 'id' field is already correct.
+    # Assuming 'id' field exists and is the correct string type.
+    # If MongoDB uses _id (ObjectId or string), this function would handle mapping.
+    # For example, if _id is ObjectId:
+    # if doc and '_id' in doc and isinstance(doc['_id'], ObjectId):
+    #    doc['id'] = str(doc['_id']) # Convert ObjectId to string for GraphQL ID
+    # If _id is string and you want to use 'id' in GraphQL:
+    # elif doc and '_id' in doc and 'id' not in doc:
+    #    doc['id'] = doc['_id']
     return doc
 
 class KeywordSpan(graphene.ObjectType):
@@ -33,7 +25,6 @@ class KeywordSpan(graphene.ObjectType):
     endIndex = graphene.Int(required=True)
 
     def resolve_keyword(self, info):
-        # 'self' is a dictionary from a keywordSpans document in MongoDB
         keyword_id = self.get("keyword_id")
         if keyword_id:
             keyword_doc = get_collection("keywords").find_one({"id": keyword_id})
@@ -46,10 +37,9 @@ class TranscriptChunk(graphene.ObjectType):
     id = graphene.ID(required=True)
     session = graphene.Field(graphene.NonNull(lambda: Session))
     content = graphene.String(required=True)
-    keywordSpans = graphene.List(graphene.NonNull(KeywordSpan), required=True) # This is an array of embedded documents or IDs
+    keywordSpans = graphene.List(graphene.NonNull(KeywordSpan))
 
     def resolve_session(self, info):
-        # 'self' is a TranscriptChunk document
         session_id = self.get("session_id")
         if session_id:
             session_doc = get_collection("sessions").find_one({"id": session_id})
@@ -57,12 +47,8 @@ class TranscriptChunk(graphene.ObjectType):
         return None
 
     def resolve_keywordSpans(self, info):
-        # 'self' is a TranscriptChunk document
-        # Assuming keywordSpans are stored as an array of embedded documents in TranscriptChunk
+        # Assuming keywordSpans are stored as an array of embedded documents
         spans_data = self.get("keywordSpans", [])
-        # If spans_data are just IDs, we would fetch them:
-        # keyword_span_ids = self.get("keyword_span_ids", [])
-        # spans_data = [map_document_id(get_collection("keywordSpans").find_one({"id": kid})) for kid in keyword_span_ids]
         return [map_document_id(span) for span in spans_data if span]
 
 
@@ -73,11 +59,10 @@ class Definition(graphene.ObjectType):
     keyword = graphene.Field(graphene.NonNull(lambda: Keyword))
     contextSummary = graphene.String(required=True)
     definitionText = graphene.String(required=True)
-    createdAt = graphene.DateTime(required=True) # Ensure this is stored as datetime in MongoDB
+    createdAt = graphene.DateTime(required=True)
     modelUsed = graphene.String(required=True)
 
     def resolve_keyword(self, info):
-        # 'self' is a Definition document
         keyword_id = self.get("keyword_id")
         if keyword_id:
             keyword_doc = get_collection("keywords").find_one({"id": keyword_id})
@@ -91,10 +76,9 @@ class Keyword(graphene.ObjectType):
     slug = graphene.String(required=True)
     term = graphene.String(required=True)
     session = graphene.Field(graphene.NonNull(lambda: Session))
-    definitions = graphene.List(graphene.NonNull(Definition), required=True) # Array of IDs or embedded
+    definitions = graphene.List(graphene.NonNull(Definition))
 
     def resolve_session(self, info):
-        # 'self' is a Keyword document
         session_id = self.get("session_id")
         if session_id:
             session_doc = get_collection("sessions").find_one({"id": session_id})
@@ -102,38 +86,44 @@ class Keyword(graphene.ObjectType):
         return None
 
     def resolve_definitions(self, info):
-        # 'self' is a Keyword document
-        # Assuming definitions are stored as an array of embedded documents in Keyword
-        # If they are IDs:
         definition_ids = self.get("definition_ids", [])
         defs_collection = get_collection("definitions")
-        # Graphene expects a list of Definition-like dicts
         definitions_data = [map_document_id(defs_collection.find_one({"id": def_id})) for def_id in definition_ids]
         return [d for d in definitions_data if d]
 
 
-class Session(graphene.ObjectType):
+class Session(graphene.ObjectType): # UPDATED Session Graphene Type
     class Meta:
         description = "Represents a recorded or processed session."
     id = graphene.ID(required=True)
     title = graphene.String()
     source = graphene.String(required=True)
-    createdAt = graphene.DateTime(required=True) # Ensure this is stored as datetime in MongoDB
-    transcript = graphene.List(graphene.NonNull(TranscriptChunk), required=True) # Array of IDs or embedded
-    keywords = graphene.List(graphene.NonNull(Keyword), required=True) # Array of IDs or embedded
+    createdAt = graphene.DateTime(required=True)
     summary = graphene.String()
 
+    # New fields for YouTube and transcription
+    # These will map to MongoDB document fields like 'youtube_url', 'transcription_status', 'full_transcript_text'
+    # Graphene's default resolver handles dict keys that are snake_case for camelCase fields.
+    # Using 'name' makes it explicit if dict keys differ or specific GraphQL names are desired.
+    youtubeUrl = graphene.String(name="youtube_url")
+    transcriptionStatus = graphene.String(name="transcription_status")
+    fullTranscriptText = graphene.String(name="full_transcript_text")
+
+    transcript = graphene.List(graphene.NonNull(TranscriptChunk))
+    keywords = graphene.List(graphene.NonNull(Keyword))
+
+    # Default resolvers are used for youtubeUrl, transcriptionStatus, fullTranscriptText.
+    # This means Graphene expects the resolved 'Session' object (a dict from MongoDB)
+    # to have keys like 'youtube_url', 'transcription_status', 'full_transcript_text'.
+    # The 'name' argument maps these dict keys to the camelCase GraphQL field names.
+
     def resolve_transcript(self, info):
-        # 'self' is a Session document
-        # Assuming transcript chunks are stored by IDs in the Session doc
         transcript_ids = self.get("transcript_ids", [])
         chunks_collection = get_collection("transcriptChunks")
         transcript_data = [map_document_id(chunks_collection.find_one({"id": t_id})) for t_id in transcript_ids]
         return [t for t in transcript_data if t]
 
-
     def resolve_keywords(self, info):
-        # 'self' is a Session document
         keyword_ids = self.get("keyword_ids", [])
         keywords_collection = get_collection("keywords")
         keywords_data = [map_document_id(keywords_collection.find_one({"id": k_id})) for k_id in keyword_ids]
@@ -141,28 +131,27 @@ class Session(graphene.ObjectType):
 
 # --- Query Class with MongoDB Resolvers ---
 class Query(graphene.ObjectType):
-    hello = graphene.String(name=graphene.String(default_value="stranger"))
+    # Argument 'name' was 'default_name' in prompt, using 'name_arg' for clarity if field is 'hello'
+    # If GraphQL field is 'hello(default_name: "stranger")', then arg in resolver is 'default_name'.
+    # Prompt: hello = graphene.String(name="default_name", default_value="stranger") - this makes the ARGUMENT 'default_name'.
+    # The field itself is still 'hello'.
+    hello = graphene.String(args={'name_arg': graphene.String(default_value="stranger")})
 
     session = graphene.Field(Session, id=graphene.ID(required=True))
     sessions = graphene.List(graphene.NonNull(Session))
     keyword_by_slug = graphene.Field(Keyword, slug=graphene.String(required=True))
     search_keyword = graphene.List(graphene.NonNull(Keyword), term=graphene.String(required=True))
 
-    def resolve_hello(self, info, name):
-        return f"Hello, {name}!"
+    def resolve_hello(self, info, name_arg): # Argument name matches the key in 'args'
+        return f"Hello, {name_arg}!"
 
     def resolve_session(self, info, id):
         sessions_collection = get_collection("sessions")
-        # Assuming 'id' is a queryable field in your MongoDB 'sessions' collection
-        # If 'id' corresponds to MongoDB's '_id' and it's an ObjectId, you'd do:
-        # from bson import ObjectId
-        # session_doc = sessions_collection.find_one({"_id": ObjectId(id)})
         session_doc = sessions_collection.find_one({"id": id})
         return map_document_id(session_doc)
 
     def resolve_sessions(self, info):
         sessions_collection = get_collection("sessions")
-        # Convert cursor to list and map IDs if necessary
         return [map_document_id(doc) for doc in sessions_collection.find()]
 
     def resolve_keyword_by_slug(self, info, slug):
@@ -172,9 +161,6 @@ class Query(graphene.ObjectType):
 
     def resolve_search_keyword(self, info, term):
         keywords_collection = get_collection("keywords")
-        # Simple text search using regex. For more advanced search, MongoDB text indexes are better.
-        # Ensure 'term' field is indexed for performance if using regex often.
-        # Using 'i' for case-insensitive search
         query = {"term": {"$regex": term, "$options": "i"}}
         return [map_document_id(doc) for doc in keywords_collection.find(query)]
 

@@ -127,3 +127,66 @@ This query will return a list of `Keyword` objects that match the search term, i
     -   The server logs when a client connects and disconnects.
     -   The server logs the size of each received audio chunk.
     -   This is currently a mock endpoint; it logs received data but does not perform any actual audio processing or storage.
+
+<!-- WHISPER_CELERY_DOC_V1 -->
+
+## Transcription Service (YouTube & Whisper)
+
+This project uses OpenAI's Whisper model (via the `openai-whisper` package) to transcribe audio from YouTube videos. This process is handled asynchronously using Celery with Redis as a message broker.
+
+### New Dependencies
+
+The following Python packages have been added for this functionality:
+-   `openai-whisper`: For audio transcription.
+-   `yt-dlp`: For downloading audio/video from YouTube.
+-   `pydub`: For audio file manipulation (if needed).
+-   `celery`: For distributed task queuing.
+-   `redis`: Python client for Redis, used as the Celery broker.
+
+Ensure these are installed (they are listed in `requirements.txt`).
+
+### Prerequisites
+
+1.  **Redis Server**:
+    -   A Redis server must be running and accessible. By default, the application and Celery expect Redis at `redis://localhost:6379/0`.
+    -   You can configure the Redis URL via the `CELERY_BROKER_URL` environment variable.
+
+2.  **FFmpeg**:
+    -   `yt-dlp` requires FFmpeg to be installed on the system for audio extraction and conversion (e.g., to MP3). Make sure `ffmpeg` is in your system's PATH.
+
+3.  **Whisper Model Download**:
+    -   The first time a Celery worker starts a transcription task, the `openai-whisper` library will download the specified model files (currently configured for the "base" model). This may take some time and requires internet access for the worker.
+
+### Running Celery Workers
+
+To process transcription tasks, you need to run one or more Celery workers. Start a worker from the project root directory using:
+
+```bash
+celery -A celery_app.app worker -l info
+# For environments where gevent is used (like our Flask dev server for WebSockets):
+# celery -A celery_app.app worker -l info -P gevent
+```
+*(Adjust `-P gevent` based on your Celery worker's concurrency needs and environment. For CPU-bound tasks like Whisper, the default prefork pool (`-P prefork`, which is the default) is often suitable.)*
+
+### Updated GraphQL `Session` Type
+
+The `Session` type in GraphQL now includes the following additional fields related to YouTube transcription:
+
+-   `youtubeUrl: String`: The URL of the YouTube video associated with the session.
+-   `transcriptionStatus: String`: The current status of the transcription job (e.g., "pending", "processing", "completed", "failed").
+-   `fullTranscriptText: String`: The full transcribed text of the video audio, available once the status is "completed".
+
+**Example Query:**
+```graphql
+query GetSessionWithTranscription($id: ID!) {
+  session(id: $id) {
+    id
+    title
+    youtubeUrl
+    transcriptionStatus
+    fullTranscriptText
+    createdAt
+    source
+  }
+}
+```

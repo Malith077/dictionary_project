@@ -8,3 +8,10 @@ pydantic==2.5.3
 Flask-Sockets==0.2.1
 gevent==25.5.1
 gevent-websocket==0.10.1
+
+# Dependencies for Whisper transcription and Celery job queue
+openai-whisper==20231117
+yt-dlp==2023.12.30
+pydub==0.25.1
+celery==5.3.6
+redis==5.0.1

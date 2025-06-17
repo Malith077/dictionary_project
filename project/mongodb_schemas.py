@@ -8,25 +8,14 @@ from pydantic import BaseModel, Field
 class KeywordSpanSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the keyword span")
     keyword_id: str = Field(..., description="Identifier of the associated keyword")
-    # In Pydantic v2, aliasing for fields like '_id' from MongoDB can be done using Field(alias='_id')
-    # For now, we are assuming 'id' is the field name used in DB documents.
     startIndex: int = Field(..., description="Start index of the keyword in the content")
     endIndex: int = Field(..., description="End index of the keyword in the content")
-
-    class Config:
-        # Example for allowing population by field name OR alias if we used aliasing for _id
-        # populate_by_name = True
-        # Example for allowing extra fields if MongoDB docs might have them (though stricter is often better)
-        # extra = "ignore"
-        pass
 
 class TranscriptChunkSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the transcript chunk")
     session_id: str = Field(..., description="Identifier of the parent session")
     content: str = Field(..., description="Text content of the transcript chunk")
     keywordSpans: List[KeywordSpanSchema] = Field(default_factory=list, description="List of keyword spans within this chunk")
-    # If keywordSpans were stored as IDs, it would be:
-    # keyword_span_ids: List[str] = Field(default_factory=list)
 
 class DefinitionSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the definition")
@@ -41,18 +30,20 @@ class KeywordSchema(BaseModel):
     slug: str = Field(..., description="URL-safe unique slug for the keyword")
     term: str = Field(..., description="The keyword term itself")
     session_id: str = Field(..., description="Identifier of the session where this keyword was identified")
-    # In MongoDB, this would likely be a list of definition IDs,
-    # which are then resolved by the GraphQL layer.
     definition_ids: List[str] = Field(default_factory=list, description="List of IDs of definitions for this keyword")
 
-class SessionSchema(BaseModel):
+class SessionSchema(BaseModel): # Updated SessionSchema
     id: str = Field(..., description="Unique identifier for the session")
     title: Optional[str] = Field(None, description="Optional title for the session")
     source: str = Field(..., description="Source of the session (e.g., 'youtube', 'mic')")
     createdAt: datetime = Field(..., description="Timestamp of when the session was created")
     summary: Optional[str] = Field(None, description="Optional summary of the session")
-    # In MongoDB, these would likely be lists of IDs,
-    # which are then resolved by the GraphQL layer.
+
+    youtube_url: Optional[str] = Field(None, description="URL of the YouTube video, if applicable")
+    transcription_status: Optional[str] = Field(None, description="Status of transcription (e.g., pending, processing, completed, failed)")
+    full_transcript_text: Optional[str] = Field(None, description="The full transcribed text, if available")
+
+    # Existing fields for relationships
     transcript_ids: List[str] = Field(default_factory=list, description="List of IDs of transcript chunks for this session")
     keyword_ids: List[str] = Field(default_factory=list, description="List of IDs of keywords identified in this session")
 
@@ -64,17 +55,18 @@ if __name__ == "__main__":
         "createdAt": datetime.now(),
         "transcript_ids": ["chunk1", "chunk2"],
         "keyword_ids": ["keywordA"],
-        "title": "My First Session" # Optional field
+        "title": "My First Session",
+        "youtube_url": "https://youtube.com/watch?v=example",
+        "transcription_status": "pending"
     }
     try:
         session_instance = SessionSchema(**sample_session_data)
         print("Session instance created successfully:")
         print(session_instance.model_dump_json(indent=2))
+        assert session_instance.youtube_url == "https://youtube.com/watch?v=example"
+        assert session_instance.full_transcript_text is None
 
-        # Example with a missing required field (should raise error)
-        invalid_session_data = {"source": "mic"}
-        # SessionSchema(**invalid_session_data) # This would raise ValidationError
-    except Exception as e: # Pydantic raises ValidationError
+    except Exception as e:
         print(f"Error creating Pydantic model instance: {e}")
 
     sample_chunk_data = {
