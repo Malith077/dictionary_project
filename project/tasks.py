@@ -1,27 +1,20 @@
 import os
 import tempfile
-from celery_app import app as celery_app # Import the Celery app instance from celery_app.py
+import uuid
+from datetime import datetime
+from celery_app import app as celery_app
 from project.db import get_collection
 
-# Attempt to import necessary libraries for the task.
-# These will only be successful if the environment has them installed.
 try:
-    import whisper # from openai-whisper
+    import whisper
     import yt_dlp
     from pydub import AudioSegment
 except ImportError as e:
-    print(f"Warning: One or more required packages (whisper, yt_dlp, pydub) are not installed. Transcription task will fail if run. Error: {e}")
-    # Define dummy/placeholder functions or classes if needed to allow module to load for Celery worker discovery
-    # For now, we'll let it raise ImportError if a worker tries to load this without dependencies.
-    # Or, Celery might fail to register the task if the module can't be imported.
-    # A common pattern is to guard the task definition or its core logic.
-    # However, for now, let's assume the environment where the worker runs will have these.
-    pass
+    print(f"Warning: Required packages not installed. Error: {e}")
 
-# Global variable for the Whisper model to load it only once per worker process (if possible)
-# This is a common optimization.
+# Global Whisper model
 whisper_model = None
-WHISPER_MODEL_NAME = "base" # As per user confirmation
+WHISPER_MODEL_NAME = "base"
 
 def load_whisper_model():
     global whisper_model
@@ -32,166 +25,306 @@ def load_whisper_model():
             print("Whisper model loaded successfully.")
         except Exception as e:
             print(f"Error loading Whisper model: {e}")
-            # Depending on retry strategy, could raise an exception here to make task retry.
-            raise # Re-raise to make Celery task fail and potentially retry
+            raise
     return whisper_model
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60) # Example retry parameters
-def transcribe_youtube_audio_task(self, session_id: str, youtube_url: str):
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)  # 5 minutes between retries
+def transcribe_youtube_audio_task(self, session_id: str, youtube_url: str, enhance_options: list = None):
     """
-    Celery task to download audio from a YouTube URL, transcribe it,
-    and update the Session document in MongoDB.
+    Complete YouTube processing task:
+    1. Download video and extract audio
+    2. Transcribe audio using Whisper
+    3. Save transcript and metadata to database
+    4. Process transcript chunks and keywords (if enabled)
     """
+    if enhance_options is None:
+        enhance_options = []
+    
     sessions_collection = get_collection("sessions")
-
+    
     try:
-        print(f"Task transcribe_youtube_audio_task started for session_id: {session_id}, youtube_url: {youtube_url}")
-
-        # 1. Update Session status to "processing"
+        print(f"Starting YouTube processing task for session: {session_id}")
+        
+        # Update status to processing
         sessions_collection.update_one(
             {"id": session_id},
-            {"$set": {"transcription_status": "processing"}}
+            {"$set": {
+                "transcription_status": "processing",
+                "processing_metadata.processing_started_at": datetime.utcnow()
+            }}
         )
-        print(f"Updated session {session_id} status to 'processing'")
-
-        # 2. Download Audio using yt-dlp
-        # Create a temporary directory to store downloaded audio
-        with tempfile.TemporaryDirectory() as tmpdir:
-            audio_filename_template = os.path.join(tmpdir, 'audio_%(id)s.%(ext)s')
-
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': audio_filename_template,
-                'noplaylist': True,
-                'quiet': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio', # Requires ffmpeg to be installed in the environment
-                    'preferredcodec': 'mp3',     # Output format
-                    'preferredquality': '192',   # Bitrate
-                }],
-                # Consider adding user agent if downloads are blocked
-                # 'http_headers': {'User-Agent': 'Mozilla/5.0 ...'}
-            }
-
-            downloaded_audio_path = None
-            print(f"Starting audio download for {youtube_url}...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(youtube_url, download=True)
-                # yt-dlp modifies outtmpl to the actual path after download and postprocessing
-                # The actual path is usually in info_dict['requested_downloads'][0]['filepath']
-                # or we can list files in tmpdir if only one is expected.
-
-                # A more robust way to get the downloaded file path:
-                # Check info_dict['requested_downloads'] for the filepath
-                # For simplicity, assume one file is downloaded and postprocessed to mp3
-                # This part might need adjustment based on exact yt-dlp output structure
-                # and if the 'outtmpl' directly gives the final path after postprocessing.
-                # Often, ydl.prepare_filename(info_dict) gives the template before postprocessing.
-                # After postprocessing, the filename changes.
-
-                # Let's find the mp3 file in the temp directory.
-                # This is a bit of a hack; yt-dlp's info_dict should ideally provide the final path.
-                # If 'outtmpl' is a template like `%(title)s.%(ext)s`, then `ydl.prepare_filename(info_dict)`
-                # would give the path *before* postprocessing. After FFmpegExtractAudio, ext changes.
-
-                # A common way is to rely on the `info_dict['filepath']` if using `download=False` then `ydl.download([url])`
-                # or check `info_dict['requested_downloads'][0]['filepath']`
-
-                # Given the template, the ID is part of the filename.
-                # Example: audio_VIDEOID.mp3
-                # Let's assume the postprocessor correctly names it.
-                # We can list files in tmpdir and find the .mp3 file.
-
-                # Simplified approach: find the first .mp3 file in tmpdir
-                for f_name in os.listdir(tmpdir):
-                    if f_name.endswith(".mp3"):
-                        downloaded_audio_path = os.path.join(tmpdir, f_name)
-                        break
-
-                if not downloaded_audio_path:
-                    raise Exception("Downloaded audio file (mp3) not found after yt-dlp processing.")
-
-            print(f"Audio downloaded successfully: {downloaded_audio_path}")
-
-            # (Optional) Convert to WAV using pydub if Whisper prefers WAV or for consistency
-            # This step might be redundant if Whisper handles MP3 well.
-            # For now, assuming Whisper handles MP3 from yt-dlp. If not:
-            # wav_path = os.path.join(tmpdir, "audio.wav")
-            # audio = AudioSegment.from_mp3(downloaded_audio_path)
-            # audio.export(wav_path, format="wav")
-            # print(f"Converted to WAV: {wav_path}")
-            # current_audio_path_for_whisper = wav_path
-            current_audio_path_for_whisper = downloaded_audio_path
-
-
-            # 3. Transcribe Audio using Whisper
-            print(f"Loading Whisper model ('{WHISPER_MODEL_NAME}') for transcription...")
-            model = load_whisper_model() # Get or load the model
-            if not model:
-                 raise Exception("Whisper model could not be loaded.")
-
-            print(f"Starting transcription for {current_audio_path_for_whisper}...")
-            result = model.transcribe(current_audio_path_for_whisper, fp16=False) # fp16=False if not using GPU or issues
-            transcribed_text = result["text"]
-            print(f"Transcription successful for session {session_id}.")
-            # print(f"Transcribed text (first 100 chars): {transcribed_text[:100]}...")
-
-
-            # 4. Store Transcript and update status
+        
+        # Step 1: Download and extract audio
+        print(f"Step 1: Downloading audio from {youtube_url}")
+        audio_path, video_info = download_youtube_audio(youtube_url)
+        
+        # Update session with video metadata
+        sessions_collection.update_one(
+            {"id": session_id},
+            {"$set": {
+                "title": video_info.get("title", "Unknown Title"),
+                "processing_metadata.video_title": video_info.get("title"),
+                "processing_metadata.video_duration": video_info.get("duration"),
+                "processing_metadata.video_description": video_info.get("description", "")[:500],  # Truncate
+                "processing_metadata.audio_format": "mp3"
+            }}
+        )
+        
+        # Step 2: Transcribe audio
+        print(f"Step 2: Transcribing audio for session {session_id}")
+        model = load_whisper_model()
+        result = model.transcribe(audio_path, fp16=False)
+        transcribed_text = result["text"].strip()
+        
+        # Step 3: Save complete transcript
+        print(f"Step 3: Saving transcript for session {session_id}")
+        sessions_collection.update_one(
+            {"id": session_id},
+            {"$set": {
+                "full_transcript_text": transcribed_text,
+                "transcription_status": "completed",
+                "processing_metadata.processing_completed_at": datetime.utcnow(),
+                "processing_metadata.transcription_model": WHISPER_MODEL_NAME
+            }}
+        )
+        
+        # Step 4: Process transcript chunks (if requested)
+        if "create_chunks" in enhance_options:
+            print(f"Step 4: Creating transcript chunks for session {session_id}")
+            chunk_ids = create_transcript_chunks(session_id, transcribed_text)
             sessions_collection.update_one(
                 {"id": session_id},
-                {"$set": {
-                    "full_transcript_text": transcribed_text,
-                    "transcription_status": "completed"
-                }}
+                {"$set": {"transcript_ids": chunk_ids}}
             )
-            print(f"Stored transcript and updated session {session_id} status to 'completed'")
-
-        # Temporary directory and its contents are automatically cleaned up here.
-        return {"status": "success", "session_id": session_id, "message": "Transcription completed."}
-
+        
+        # Step 5: Extract and process keywords (if requested)
+        if "extract_keywords" in enhance_options:
+            print(f"Step 5: Extracting keywords for session {session_id}")
+            keyword_ids = extract_and_save_keywords(session_id, transcribed_text)
+            sessions_collection.update_one(
+                {"id": session_id},
+                {"$set": {"keyword_ids": keyword_ids}}
+            )
+        
+        print(f"YouTube processing completed successfully for session {session_id}")
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "transcript_length": len(transcribed_text),
+            "processing_time": "completed"
+        }
+        
     except Exception as exc:
-        print(f"Error during transcription task for session {session_id}: {exc}")
+        print(f"Error in YouTube processing task for session {session_id}: {exc}")
+        
+        # Log the error and update session status
         sessions_collection.update_one(
             {"id": session_id},
-            {"$set": {"transcription_status": "failed", "full_transcript_text": f"Error: {str(exc)}"}}
+            {"$set": {
+                "transcription_status": "failed",
+                "processing_metadata.error_log": [str(exc)],
+                "processing_metadata.processing_completed_at": datetime.utcnow()
+            }}
         )
-        # Retry the task if it's a retryable error
-        # self.retry(exc=exc) # Celery's built-in retry mechanism
-        # For now, just log and mark as failed. Retry logic can be complex.
-        # Re-raising will make Celery mark it as failed and retry based on task parameters.
-        raise # Re-raise so Celery knows it failed and handles retries/failure logging.
+        
+        # Retry logic
+        if self.request.retries < self.max_retries:
+            print(f"Retrying task (attempt {self.request.retries + 1}/{self.max_retries})")
+            raise self.retry(exc=exc)
+        else:
+            print(f"Max retries reached for session {session_id}")
+            raise
 
-if __name__ == '__main__':
-    # This block is for direct testing of the task file, not for Celery execution.
-    # You would need to have Redis running and a Celery worker started separately
-    # to actually process tasks submitted with .delay() or .apply_async().
-    print("This file defines Celery tasks. To run them, start a Celery worker:")
-    print("celery -A celery_app.app worker -l info")
-    # Example of how to manually call the task function for testing (bypassing Celery queue):
-    # if False: # Set to true to test directly (requires DB, yt-dlp, whisper, ffmpeg)
-    #     print("Attempting direct call to transcribe_youtube_audio_task (for testing only)...")
-    #     # Ensure you have a MongoDB instance running and project.db is configured.
-    #     # Create a dummy session entry in DB first for the task to update.
-    #     sample_session_id = "test_session_direct_call"
-    #     sample_youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ" # Example video
-    #     sessions_coll = get_collection("sessions")
-    #     sessions_coll.update_one(
-    #         {"id": sample_session_id},
-    #         {"$set": {
-    #             "youtube_url": sample_youtube_url,
-    #             "transcription_status": "pending",
-    #             "source": "youtube", "createdAt": datetime.utcnow() # Add other required fields
-    #         }},
-    #         upsert=True
-    #     )
-    #     try:
-    #         # Note: `self` argument is missing here. For direct calls, Celery task's `self` isn't populated.
-    #         # If the task uses `self.request` or `self.retry`, direct calls will fail or behave differently.
-    #         # Our current task uses `self` for `bind=True` but not explicitly in the code yet for `self.retry`.
-    #         # To make it callable directly without `self`, you'd need to adjust or pass None.
-    #         # For a bound task, Celery provides `self`.
-    #         # transcribe_youtube_audio_task(sample_session_id, sample_youtube_url) # This won't work directly for bound task
-    #         print("Direct call test: To properly test, submit via task.delay() and run a worker.")
-    #     except Exception as e:
-    #         print(f"Error during direct call test: {e}")
+
+def download_youtube_audio(youtube_url: str) -> tuple:
+    """Download audio from YouTube URL and return path + video info."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_filename_template = os.path.join(tmpdir, 'audio_%(id)s.%(ext)s')
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': audio_filename_template,
+            'noplaylist': True,
+            'quiet': False,  # Set to False to see more debugging info
+            'no_warnings': False,
+            'extractaudio': True,
+            'audioformat': 'mp3',
+            'audioquality': 192,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            # Anti-bot measures
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            },
+            'extractor_retries': 3,
+            'fragment_retries': 3,
+            'retries': 3,
+            'file_access_retries': 3,
+            'sleep_interval': 1,
+            'max_sleep_interval': 5,
+            # Use cookies if available (helps with rate limiting)
+            'cookiefile': None,
+            # Bypass geo-blocking if needed
+            'geo_bypass': True,
+            # Additional options to help with YouTube issues
+            'youtube_include_dash_manifest': False,
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                print(f"Attempting to download: {youtube_url}")
+                info_dict = ydl.extract_info(youtube_url, download=True)
+                
+                # Find the downloaded MP3 file
+                downloaded_audio_path = None
+                for filename in os.listdir(tmpdir):
+                    if filename.endswith(".mp3"):
+                        downloaded_audio_path = os.path.join(tmpdir, filename)
+                        break
+                
+                if not downloaded_audio_path:
+                    raise Exception("Downloaded audio file not found after processing")
+                
+                # Move file to a persistent temporary location for processing
+                persistent_audio_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+                os.rename(downloaded_audio_path, persistent_audio_path)
+                
+                print(f"Successfully downloaded audio to: {persistent_audio_path}")
+                return persistent_audio_path, info_dict
+                
+        except yt_dlp.DownloadError as e:
+            if "403" in str(e) or "Forbidden" in str(e):
+                print(f"YouTube blocked the request. Trying with different format...")
+                # Try with a different format as fallback
+                fallback_opts = ydl_opts.copy()
+                fallback_opts['format'] = 'worstaudio/worst'  # Try worst quality as fallback
+                fallback_opts['sleep_interval'] = 3  # Longer delay
+                
+                try:
+                    with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
+                        info_dict = ydl_fallback.extract_info(youtube_url, download=True)
+                        
+                        # Find the downloaded file
+                        downloaded_audio_path = None
+                        for filename in os.listdir(tmpdir):
+                            if any(filename.endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.opus']):
+                                downloaded_audio_path = os.path.join(tmpdir, filename)
+                                break
+                        
+                        if not downloaded_audio_path:
+                            raise Exception("Fallback download also failed to create audio file")
+                        
+                        # Convert to mp3 if needed
+                        if not downloaded_audio_path.endswith('.mp3'):
+                            mp3_path = os.path.join(tmpdir, 'converted_audio.mp3')
+                            audio = AudioSegment.from_file(downloaded_audio_path)
+                            audio.export(mp3_path, format="mp3")
+                            downloaded_audio_path = mp3_path
+                        
+                        persistent_audio_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+                        os.rename(downloaded_audio_path, persistent_audio_path)
+                        
+                        print(f"Fallback download successful: {persistent_audio_path}")
+                        return persistent_audio_path, info_dict
+                        
+                except Exception as fallback_error:
+                    raise Exception(f"Both primary and fallback downloads failed. Primary: {str(e)}, Fallback: {str(fallback_error)}")
+            else:
+                raise e
+
+
+def create_transcript_chunks(session_id: str, transcript_text: str, chunk_size: int = 1000) -> list:
+    """Break transcript into chunks and save to database."""
+    chunks_collection = get_collection("transcript_chunks")
+    chunk_ids = []
+    
+    # Simple chunking by character count with word boundaries
+    words = transcript_text.split()
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        if current_length + len(word) + 1 > chunk_size and current_chunk:
+            # Save current chunk
+            chunk_id = str(uuid.uuid4())
+            chunk_text = " ".join(current_chunk)
+            
+            chunk_document = {
+                "id": chunk_id,
+                "session_id": session_id,
+                "content": chunk_text,
+                "keywordSpans": [],
+                "created_at": datetime.utcnow(),
+                "chunk_index": len(chunk_ids)
+            }
+            
+            chunks_collection.insert_one(chunk_document)
+            chunk_ids.append(chunk_id)
+            
+            # Reset for next chunk
+            current_chunk = [word]
+            current_length = len(word)
+        else:
+            current_chunk.append(word)
+            current_length += len(word) + 1
+    
+    # Save final chunk if any content remains
+    if current_chunk:
+        chunk_id = str(uuid.uuid4())
+        chunk_text = " ".join(current_chunk)
+        
+        chunk_document = {
+            "id": chunk_id,
+            "session_id": session_id,
+            "content": chunk_text,
+            "keywordSpans": [],
+            "created_at": datetime.utcnow(),
+            "chunk_index": len(chunk_ids)
+        }
+        
+        chunks_collection.insert_one(chunk_document)
+        chunk_ids.append(chunk_id)
+    
+    return chunk_ids
+
+
+def extract_and_save_keywords(session_id: str, transcript_text: str) -> list:
+    """Extract keywords from transcript and save to database."""
+    keywords_collection = get_collection("keywords")
+    keyword_ids = []
+    
+    # Simple keyword extraction (you could enhance this with NLP libraries)
+    # For now, let's extract words that appear frequently and are longer than 4 characters
+    words = transcript_text.lower().split()
+    word_freq = {}
+    
+    for word in words:
+        # Clean word (remove punctuation)
+        clean_word = ''.join(c for c in word if c.isalnum())
+        if len(clean_word) > 4:  # Only consider longer words
+            word_freq[clean_word] = word_freq.get(clean_word, 0) + 1
+    
+    # Get top 20 most frequent words as keywords
+    top_keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:20]
+    
+    for keyword, frequency in top_keywords:
+        keyword_id = str(uuid.uuid4())
+        
+        keyword_document = {
+            "id": keyword_id,
+            "slug": keyword.lower().replace(" ", "-"),
+            "term": keyword,
+            "session_id": session_id,
+            "definition_ids": [],
+            "frequency": frequency,
+            "created_at": datetime.utcnow()
+        }
+        
+        keywords_collection.insert_one(keyword_document)
+        keyword_ids.append(keyword_id)
+    
+    return keyword_ids

@@ -28,6 +28,10 @@ app.conf.update(
     # accept_content=['json'],  # Default
     # result_serializer='json', # Default
     # timezone='UTC', # Example timezone
+    # Configuration for better Windows compatibility
+    broker_connection_retry_on_startup=True,
+    worker_prefetch_multiplier=1,  # Process one task at a time to avoid memory issues
+    task_acks_late=True,  # Acknowledge tasks only after completion
     # enable_utc=True, # Example
 )
 
