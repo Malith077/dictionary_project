@@ -1,330 +1,320 @@
 import os
 import tempfile
-import uuid
+import uuid # For generating TranscriptChunk IDs
 from datetime import datetime
+
 from celery_app import app as celery_app
 from project.db import get_collection
+from project.mongodb_schemas import TranscriptChunkSchema # For validation if inserting Pydantic models
 
+# Attempt to import NLP/ML libraries
+NLP_LIBS_AVAILABLE = False
 try:
     import whisper
     import yt_dlp
-    from pydub import AudioSegment
-except ImportError as e:
-    print(f"Warning: Required packages not installed. Error: {e}")
+    from pydub import AudioSegment # Keep for potential audio conversion, though yt-dlp handles mp3
 
-# Global Whisper model
-whisper_model = None
+    from sentence_transformers import SentenceTransformer
+    from keybert import KeyBERT
+    from project.vector_db import add_chunk_embedding, get_chroma_collection # ChromaDB functions
+    # import nltk # For sentence tokenization if Whisper segments are not granular enough
+
+    NLP_LIBS_AVAILABLE = True
+    print("All NLP/ML libraries imported successfully for tasks.py.")
+except ImportError as e:
+    print(f"WARNING (project.tasks): One or more NLP/ML packages (whisper, yt_dlp, pydub, sentence-transformers, keybert, chromadb) are not installed. Tasks will not run correctly. Error: {e}")
+    # Define placeholders if needed for Celery to register tasks even if libs are missing.
+    # This allows the rest of the app to load if Celery worker isn't the current process.
+    SentenceTransformer = None
+    KeyBERT = None
+    whisper = None
+    # add_chunk_embedding might still be callable if vector_db.py loaded, but will fail if chromadb client is None.
+    # Define dummy get_chroma_collection if needed, or ensure vector_db.py handles its absence.
+    def get_chroma_collection(collection_name=None): # Dummy
+        print("WARNING: get_chroma_collection called but ChromaDB related libraries might be missing.")
+        class DummyCollection:
+            def count(self): return 0
+            def upsert(self, *args, **kwargs): pass
+        return DummyCollection()
+
+    def add_chunk_embedding(*args, **kwargs): # Dummy
+        print("WARNING: add_chunk_embedding called but ChromaDB related libraries might be missing.")
+        pass
+
+# --- Whisper Model Loading ---
+whisper_model_instance = None # Renamed to avoid conflict with whisper module
 WHISPER_MODEL_NAME = "base"
 
 def load_whisper_model():
-    global whisper_model
-    if whisper_model is None:
+    global whisper_model_instance
+    if whisper_model_instance is None and whisper: # Check if whisper module was imported
         try:
             print(f"Loading Whisper model: {WHISPER_MODEL_NAME}...")
-            whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
+            whisper_model_instance = whisper.load_model(WHISPER_MODEL_NAME)
             print("Whisper model loaded successfully.")
         except Exception as e:
             print(f"Error loading Whisper model: {e}")
             raise
-    return whisper_model
+    elif not whisper:
+        print("ERROR: Whisper library not available, cannot load model.")
+        raise ImportError("Whisper library not found, cannot proceed with transcription.")
+    return whisper_model_instance
 
+# --- Sentence Transformer Model Loading ---
+sentence_model_instance = None
+SENTENCE_MODEL_NAME = 'all-MiniLM-L6-v2'
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)  # 5 minutes between retries
-def transcribe_youtube_audio_task(self, session_id: str, youtube_url: str, enhance_options: list = None):
-    """
-    Complete YouTube processing task:
-    1. Download video and extract audio
-    2. Transcribe audio using Whisper
-    3. Save transcript and metadata to database
-    4. Process transcript chunks and keywords (if enabled)
-    """
-    if enhance_options is None:
-        enhance_options = []
-    
-    sessions_collection = get_collection("sessions")
-    
-    try:
-        print(f"Starting YouTube processing task for session: {session_id}")
-        
-        # Update status to processing
-        sessions_collection.update_one(
-            {"id": session_id},
-            {"$set": {
-                "transcription_status": "processing",
-                "processing_metadata.processing_started_at": datetime.utcnow()
-            }}
-        )
-        
-        # Step 1: Download and extract audio
-        print(f"Step 1: Downloading audio from {youtube_url}")
-        audio_path, video_info = download_youtube_audio(youtube_url)
-        
-        # Update session with video metadata
-        sessions_collection.update_one(
-            {"id": session_id},
-            {"$set": {
-                "title": video_info.get("title", "Unknown Title"),
-                "processing_metadata.video_title": video_info.get("title"),
-                "processing_metadata.video_duration": video_info.get("duration"),
-                "processing_metadata.video_description": video_info.get("description", "")[:500],  # Truncate
-                "processing_metadata.audio_format": "mp3"
-            }}
-        )
-        
-        # Step 2: Transcribe audio
-        print(f"Step 2: Transcribing audio for session {session_id}")
-        model = load_whisper_model()
-        result = model.transcribe(audio_path, fp16=False)
-        transcribed_text = result["text"].strip()
-        
-        # Step 3: Save complete transcript
-        print(f"Step 3: Saving transcript for session {session_id}")
-        sessions_collection.update_one(
-            {"id": session_id},
-            {"$set": {
-                "full_transcript_text": transcribed_text,
-                "transcription_status": "completed",
-                "processing_metadata.processing_completed_at": datetime.utcnow(),
-                "processing_metadata.transcription_model": WHISPER_MODEL_NAME
-            }}
-        )
-        
-        # Step 4: Process transcript chunks (if requested)
-        if "create_chunks" in enhance_options:
-            print(f"Step 4: Creating transcript chunks for session {session_id}")
-            chunk_ids = create_transcript_chunks(session_id, transcribed_text)
-            sessions_collection.update_one(
-                {"id": session_id},
-                {"$set": {"transcript_ids": chunk_ids}}
-            )
-        
-        # Step 5: Extract and process keywords (if requested)
-        if "extract_keywords" in enhance_options:
-            print(f"Step 5: Extracting keywords for session {session_id}")
-            keyword_ids = extract_and_save_keywords(session_id, transcribed_text)
-            sessions_collection.update_one(
-                {"id": session_id},
-                {"$set": {"keyword_ids": keyword_ids}}
-            )
-        
-        print(f"YouTube processing completed successfully for session {session_id}")
-        return {
-            "status": "success",
-            "session_id": session_id,
-            "transcript_length": len(transcribed_text),
-            "processing_time": "completed"
-        }
-        
-    except Exception as exc:
-        print(f"Error in YouTube processing task for session {session_id}: {exc}")
-        
-        # Log the error and update session status
-        sessions_collection.update_one(
-            {"id": session_id},
-            {"$set": {
-                "transcription_status": "failed",
-                "processing_metadata.error_log": [str(exc)],
-                "processing_metadata.processing_completed_at": datetime.utcnow()
-            }}
-        )
-        
-        # Retry logic
-        if self.request.retries < self.max_retries:
-            print(f"Retrying task (attempt {self.request.retries + 1}/{self.max_retries})")
-            raise self.retry(exc=exc)
-        else:
-            print(f"Max retries reached for session {session_id}")
-            raise
-
-
-def download_youtube_audio(youtube_url: str) -> tuple:
-    """Download audio from YouTube URL and return path + video info."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_filename_template = os.path.join(tmpdir, 'audio_%(id)s.%(ext)s')
-        
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': audio_filename_template,
-            'noplaylist': True,
-            'quiet': False,  # Set to False to see more debugging info
-            'no_warnings': False,
-            'extractaudio': True,
-            'audioformat': 'mp3',
-            'audioquality': 192,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            # Anti-bot measures
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            'extractor_retries': 3,
-            'fragment_retries': 3,
-            'retries': 3,
-            'file_access_retries': 3,
-            'sleep_interval': 1,
-            'max_sleep_interval': 5,
-            # Use cookies if available (helps with rate limiting)
-            'cookiefile': None,
-            # Bypass geo-blocking if needed
-            'geo_bypass': True,
-            # Additional options to help with YouTube issues
-            'youtube_include_dash_manifest': False,
-        }
-        
+def load_sentence_model():
+    global sentence_model_instance
+    if sentence_model_instance is None and SentenceTransformer: # Check if SentenceTransformer was imported
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                print(f"Attempting to download: {youtube_url}")
-                info_dict = ydl.extract_info(youtube_url, download=True)
-                
-                # Find the downloaded MP3 file
-                downloaded_audio_path = None
-                for filename in os.listdir(tmpdir):
-                    if filename.endswith(".mp3"):
-                        downloaded_audio_path = os.path.join(tmpdir, filename)
-                        break
-                
-                if not downloaded_audio_path:
-                    raise Exception("Downloaded audio file not found after processing")
-                
-                # Move file to a persistent temporary location for processing
-                persistent_audio_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
-                os.rename(downloaded_audio_path, persistent_audio_path)
-                
-                print(f"Successfully downloaded audio to: {persistent_audio_path}")
-                return persistent_audio_path, info_dict
-                
-        except yt_dlp.DownloadError as e:
-            if "403" in str(e) or "Forbidden" in str(e):
-                print(f"YouTube blocked the request. Trying with different format...")
-                # Try with a different format as fallback
-                fallback_opts = ydl_opts.copy()
-                fallback_opts['format'] = 'worstaudio/worst'  # Try worst quality as fallback
-                fallback_opts['sleep_interval'] = 3  # Longer delay
-                
-                try:
-                    with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
-                        info_dict = ydl_fallback.extract_info(youtube_url, download=True)
-                        
-                        # Find the downloaded file
-                        downloaded_audio_path = None
-                        for filename in os.listdir(tmpdir):
-                            if any(filename.endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.opus']):
-                                downloaded_audio_path = os.path.join(tmpdir, filename)
-                                break
-                        
-                        if not downloaded_audio_path:
-                            raise Exception("Fallback download also failed to create audio file")
-                        
-                        # Convert to mp3 if needed
-                        if not downloaded_audio_path.endswith('.mp3'):
-                            mp3_path = os.path.join(tmpdir, 'converted_audio.mp3')
-                            audio = AudioSegment.from_file(downloaded_audio_path)
-                            audio.export(mp3_path, format="mp3")
-                            downloaded_audio_path = mp3_path
-                        
-                        persistent_audio_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
-                        os.rename(downloaded_audio_path, persistent_audio_path)
-                        
-                        print(f"Fallback download successful: {persistent_audio_path}")
-                        return persistent_audio_path, info_dict
-                        
-                except Exception as fallback_error:
-                    raise Exception(f"Both primary and fallback downloads failed. Primary: {str(e)}, Fallback: {str(fallback_error)}")
-            else:
-                raise e
+            print(f"Loading SentenceTransformer model: {SENTENCE_MODEL_NAME}...")
+            sentence_model_instance = SentenceTransformer(SENTENCE_MODEL_NAME)
+            print("SentenceTransformer model loaded successfully.")
+        except Exception as e:
+            print(f"Error loading SentenceTransformer model: {e}")
+            raise
+    elif not SentenceTransformer:
+        print("ERROR: SentenceTransformer library not available, cannot load model.")
+        raise ImportError("SentenceTransformer library not found, cannot proceed with embeddings.")
+    return sentence_model_instance
+
+# --- KeyBERT Model Loading ---
+keybert_model_instance = None
+
+def load_keybert_model():
+    global keybert_model_instance
+    if keybert_model_instance is None and KeyBERT and SentenceTransformer: # KeyBERT uses sentence-transformers
+        try:
+            print("Loading KeyBERT model...")
+            # KeyBERT can use various embedding models; ensure the one used is compatible or explicitly set.
+            # It often defaults to a SentenceTransformer model if not specified.
+            # We can pass our loaded sentence_model_instance to KeyBERT for consistency if desired.
+            doc_model = load_sentence_model() # Ensure sentence model is loaded for KeyBERT
+            keybert_model_instance = KeyBERT(model=doc_model) # Or let KeyBERT load its default
+            print("KeyBERT model loaded successfully.")
+        except Exception as e:
+            print(f"Error loading KeyBERT model: {e}")
+            raise
+    elif not KeyBERT or not SentenceTransformer:
+        print("ERROR: KeyBERT or SentenceTransformer library not available, cannot load model.")
+        raise ImportError("KeyBERT or SentenceTransformer library not found, cannot proceed with keyword extraction.")
+    return keybert_model_instance
 
 
-def create_transcript_chunks(session_id: str, transcript_text: str, chunk_size: int = 1000) -> list:
-    """Break transcript into chunks and save to database."""
-    chunks_collection = get_collection("transcript_chunks")
-    chunk_ids = []
-    
-    # Simple chunking by character count with word boundaries
-    words = transcript_text.split()
-    current_chunk = []
-    current_length = 0
-    
-    for word in words:
-        if current_length + len(word) + 1 > chunk_size and current_chunk:
-            # Save current chunk
-            chunk_id = str(uuid.uuid4())
-            chunk_text = " ".join(current_chunk)
-            
-            chunk_document = {
-                "id": chunk_id,
-                "session_id": session_id,
-                "content": chunk_text,
-                "keywordSpans": [],
-                "created_at": datetime.utcnow(),
-                "chunk_index": len(chunk_ids)
+# --- Celery Tasks ---
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def transcribe_youtube_audio_task(self, session_id: str, youtube_url: str):
+    """
+    Downloads YouTube audio, transcribes using Whisper, creates TranscriptChunk documents,
+    and stores the full transcript in the Session document.
+    """
+    if not whisper or not yt_dlp: # Check specific critical libraries for this task
+        print(f"ERROR (Task {self.request.id if self.request else 'direct_call'}): Missing critical libraries (whisper, yt_dlp). Aborting transcription.")
+        sessions_collection = get_collection("sessions")
+        sessions_collection.update_one(
+            {"id": session_id},
+            {"$set": {"transcription_status": "failed", "full_transcript_text": "Error: Missing required libraries for transcription."}}
+        )
+        # To prevent retry if libs are missing (non-transient error)
+        # self.update_state(state='FAILURE', meta={'exc_type': 'ImportError', 'exc_message': 'Missing libraries'})
+        # raise Ignore() # Tells Celery not to retry
+        return {"status": "error", "message": "Missing libraries, task aborted."}
+
+
+    sessions_collection = get_collection("sessions")
+    chunks_collection = get_collection("transcriptChunks")
+
+    current_audio_path_for_whisper = None # Define to ensure it's available in broader scope for model.transcribe
+
+    try:
+        print(f"Task transcribe_youtube_audio_task started for session_id: {session_id}, youtube_url: {youtube_url}")
+        sessions_collection.update_one({"id": session_id}, {"$set": {"transcription_status": "processing"}})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_filename_template = os.path.join(tmpdir, 'audio_%(id)s.%(ext)s')
+            ydl_opts = {
+                'format': 'bestaudio/best', 'outtmpl': audio_filename_template,
+                'noplaylist': True, 'quiet': True,
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
             }
-            
-            chunks_collection.insert_one(chunk_document)
-            chunk_ids.append(chunk_id)
-            
-            # Reset for next chunk
-            current_chunk = [word]
-            current_length = len(word)
-        else:
-            current_chunk.append(word)
-            current_length += len(word) + 1
-    
-    # Save final chunk if any content remains
-    if current_chunk:
-        chunk_id = str(uuid.uuid4())
-        chunk_text = " ".join(current_chunk)
-        
-        chunk_document = {
-            "id": chunk_id,
-            "session_id": session_id,
-            "content": chunk_text,
-            "keywordSpans": [],
-            "created_at": datetime.utcnow(),
-            "chunk_index": len(chunk_ids)
-        }
-        
-        chunks_collection.insert_one(chunk_document)
-        chunk_ids.append(chunk_id)
-    
-    return chunk_ids
+            downloaded_audio_path = None
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(youtube_url, download=True)
+                for f_name in os.listdir(tmpdir): # Find the downloaded mp3
+                    if f_name.endswith(".mp3"): downloaded_audio_path = os.path.join(tmpdir, f_name); break
+                if not downloaded_audio_path: raise Exception("Downloaded audio (mp3) not found.")
+
+            print(f"Audio downloaded: {downloaded_audio_path}")
+            current_audio_path_for_whisper = downloaded_audio_path # Assign to broader scope variable
+
+            model = load_whisper_model()
+            print(f"Starting transcription for {current_audio_path_for_whisper}...")
+            transcription_result = model.transcribe(current_audio_path_for_whisper, fp16=False, word_timestamps=False) # Get segments
+
+            full_text = transcription_result["text"]
+            created_chunk_ids = []
+
+            print(f"Processing {len(transcription_result.get('segments', []))} transcript segments for session {session_id}...")
+            for segment in transcription_result.get("segments", []):
+                chunk_id = str(uuid.uuid4())
+                chunk_content = segment["text"].strip()
+                if not chunk_content: continue
+
+                chunk_doc_data = {
+                    "id": chunk_id,
+                    "session_id": session_id,
+                    "content": chunk_content,
+                    "start_time": segment.get("start"),
+                    "end_time": segment.get("end"),
+                    "keywordSpans": []
+                }
+                chunks_collection.insert_one(chunk_doc_data)
+                created_chunk_ids.append(chunk_id)
+
+            sessions_collection.update_one(
+                {"id": session_id},
+                {"$set": {
+                    "full_transcript_text": full_text,
+                    "transcript_ids": created_chunk_ids,
+                    "transcription_status": "completed",
+                    "nlp_status": "pending" # Set NLP status to pending after transcription
+                }}
+            )
+            print(f"Transcription successful, {len(created_chunk_ids)} chunks created for session {session_id}.")
+
+            # If transcription is successful, trigger NLP task
+            if NLP_LIBS_AVAILABLE: # Check if NLP libs are there before queueing
+                 process_nlp_for_session_task.delay(session_id=session_id)
+                 print(f"Enqueued process_nlp_for_session_task for session {session_id}")
+            else:
+                 print(f"Skipping enqueue of NLP task for session {session_id} due to missing libraries.")
+                 sessions_collection.update_one({"id": session_id}, {"$set": {"nlp_status": "nlp_skipped_missing_libs"}})
 
 
-def extract_and_save_keywords(session_id: str, transcript_text: str) -> list:
-    """Extract keywords from transcript and save to database."""
+        return {"status": "success", "session_id": session_id, "chunks_created": len(created_chunk_ids)}
+    except Exception as exc:
+        print(f"Error in transcribe_youtube_audio_task for session {session_id}: {exc}")
+        sessions_collection.update_one(
+            {"id": session_id},
+            {"$set": {"transcription_status": "failed", "full_transcript_text": f"Transcription Error: {str(exc)}"}}
+        )
+        raise
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=120)
+def process_nlp_for_session_task(self, session_id: str):
+    """
+    Processes a session's transcript chunks for NLP: embeddings and keywords.
+    """
+    if not NLP_LIBS_AVAILABLE:
+        print(f"ERROR (Task {self.request.id if self.request else 'direct_call'}): Missing critical libraries for NLP. Aborting.")
+        sessions_collection = get_collection("sessions")
+        sessions_collection.update_one(
+            {"id": session_id}, {"$set": {"nlp_status": "nlp_failed", "error_message": "Missing libraries for NLP."}}
+        )
+        return {"status": "error", "message": "Missing libraries for NLP, task aborted."}
+
+    sessions_collection = get_collection("sessions")
+    chunks_collection = get_collection("transcriptChunks")
     keywords_collection = get_collection("keywords")
-    keyword_ids = []
-    
-    # Simple keyword extraction (you could enhance this with NLP libraries)
-    # For now, let's extract words that appear frequently and are longer than 4 characters
-    words = transcript_text.lower().split()
-    word_freq = {}
-    
-    for word in words:
-        # Clean word (remove punctuation)
-        clean_word = ''.join(c for c in word if c.isalnum())
-        if len(clean_word) > 4:  # Only consider longer words
-            word_freq[clean_word] = word_freq.get(clean_word, 0) + 1
-    
-    # Get top 20 most frequent words as keywords
-    top_keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:20]
-    
-    for keyword, frequency in top_keywords:
-        keyword_id = str(uuid.uuid4())
-        
-        keyword_document = {
-            "id": keyword_id,
-            "slug": keyword.lower().replace(" ", "-"),
-            "term": keyword,
-            "session_id": session_id,
-            "definition_ids": [],
-            "frequency": frequency,
-            "created_at": datetime.utcnow()
-        }
-        
-        keywords_collection.insert_one(keyword_document)
-        keyword_ids.append(keyword_id)
-    
-    return keyword_ids
+
+    try:
+        print(f"Task process_nlp_for_session_task started for session_id: {session_id}")
+        session_doc = sessions_collection.find_one({"id": session_id})
+        if not session_doc:
+            print(f"Error: Session {session_id} not found for NLP processing.")
+            return {"status": "error", "message": f"Session {session_id} not found."}
+
+        if session_doc.get("transcription_status") != "completed":
+            print(f"Warning: Transcription for session {session_id} is not 'completed' (status: {session_doc.get('transcription_status')}). Skipping NLP.")
+            sessions_collection.update_one({"id": session_id}, {"$set": {"nlp_status": "nlp_skipped_transcription_not_done"}})
+            return {"status": "skipped", "message": "Transcription not completed."}
+
+        sessions_collection.update_one({"id": session_id}, {"$set": {"nlp_status": "nlp_processing"}})
+
+        transcript_chunk_ids = session_doc.get("transcript_ids", [])
+        if not transcript_chunk_ids:
+            print(f"No transcript chunks found for session {session_id}. Skipping NLP.")
+            sessions_collection.update_one({"id": session_id}, {"$set": {"nlp_status": "nlp_completed_no_chunks"}})
+            return {"status": "success", "message": "No chunks to process."}
+
+        sbert_model = load_sentence_model()
+        kb_model = load_keybert_model()
+        vector_collection = get_chroma_collection()
+        print(f"ChromaDB collection '{vector_collection.name}' ready, current count: {vector_collection.count()}")
+
+        all_session_keyword_ids = set(session_doc.get("keyword_ids", []))
+
+        for chunk_id in transcript_chunk_ids:
+            chunk_doc = chunks_collection.find_one({"id": chunk_id})
+            if not chunk_doc or not chunk_doc.get("content"):
+                print(f"Warning: TranscriptChunk {chunk_id} not found or has no content. Skipping.")
+                continue
+
+            chunk_content = chunk_doc["content"]
+            chunk_start_time = chunk_doc.get("start_time")
+
+            print(f"Generating embedding for chunk {chunk_id} (session {session_id})...")
+            embedding = sbert_model.encode(chunk_content).tolist()
+
+            metadata_for_chroma = {
+                "session_id": session_id,
+                "chunk_id": chunk_id,
+                "start_time": chunk_start_time if chunk_start_time is not None else -1
+            }
+            add_chunk_embedding(
+                session_id=session_id, chunk_id=chunk_id,
+                chunk_text=chunk_content, embedding_vector=embedding,
+                metadata=metadata_for_chroma
+            )
+            print(f"Stored embedding for chunk {chunk_id} in ChromaDB.")
+
+            print(f"Extracting keywords for chunk {chunk_id}...")
+            keywords_with_scores = kb_model.extract_keywords(chunk_content, top_n=5, use_mmr=True, diversity=0.7)
+            extracted_keyword_terms = [kw[0] for kw in keywords_with_scores]
+            print(f"Extracted keywords for chunk {chunk_id}: {extracted_keyword_terms}")
+
+            for term in extracted_keyword_terms:
+                # Basic slug generation, ensure it's consistent with Pydantic model's validator
+                slug = term.lower().replace(' ', '-').translate(str.maketrans('', '', '!"#$%&\'()*+,./:;<=>?@[\\]^_`{|}~'))
+
+                keyword_doc_id = str(uuid.uuid4()) # Generate ID for keyword document if new
+
+                keyword_context_data = {
+                    "transcript_chunk_id": chunk_id,
+                    "context_preview": chunk_content[:150] + "..." if len(chunk_content) > 150 else chunk_content,
+                }
+
+                update_result = keywords_collection.update_one(
+                    {"term": term, "session_id": session_id},
+                    {
+                        "$setOnInsert": { "id": keyword_doc_id, "slug": slug, "term": term, "session_id": session_id, "created_at": datetime.utcnow(), "definition_ids": [] },
+                        "$addToSet": {"contexts": keyword_context_data},
+                        "$set": {"updated_at": datetime.utcnow()}
+                    },
+                    upsert=True
+                )
+                if update_result.upserted_id: # If a new keyword document was created
+                    all_session_keyword_ids.add(keyword_doc_id) # Add the new keyword's main ID
+                else: # Keyword already existed for this session, find its ID to ensure it's in the session's list
+                    existing_kw_doc = keywords_collection.find_one({"term": term, "session_id": session_id}, {"id": 1})
+                    if existing_kw_doc:
+                        all_session_keyword_ids.add(existing_kw_doc["id"])
+            print(f"Updated/Stored keywords for chunk {chunk_id} in MongoDB.")
+
+        # Update the session with the complete list of distinct keyword IDs
+        sessions_collection.update_one({"id": session_id}, {"$set": {"keyword_ids": list(all_session_keyword_ids), "nlp_status": "nlp_completed"}})
+        print(f"NLP processing completed successfully for session {session_id}. Session keyword_ids updated.")
+        return {"status": "success", "session_id": session_id, "message": "NLP processing completed."}
+
+    except Exception as exc:
+        print(f"Error during NLP processing task for session {session_id}: {exc}")
+        sessions_collection.update_one(
+            {"id": session_id}, {"$set": {"nlp_status": "nlp_failed", "error_message": f"NLP Error: {str(exc)}"}}
+        )
+        raise
+
+if __name__ == '__main__':
+    print("This file defines Celery tasks. To run them, start a Celery worker.")
+    print("Example: celery -A celery_app.app worker -l info")

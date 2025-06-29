@@ -10,8 +10,14 @@ gevent==25.5.1
 gevent-websocket==0.10.1
 
 # Dependencies for Whisper transcription and Celery job queue
-git+https://github.com/openai/whisper.git 
+openai-whisper==20231117
 yt-dlp==2023.12.30
 pydub==0.25.1
 celery==5.3.6
 redis==5.0.1
+
+# Dependencies for NLP & Keyword Processing (Phase 2)
+keybert==0.7.0
+sentence-transformers==2.2.2
+chromadb==0.4.22
+nltk==3.8.1
