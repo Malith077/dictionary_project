@@ -37,6 +37,97 @@ Send a `POST` request to `/graphql` with a JSON body like the following:
 }
 ```
 
+<!-- PHASE3_OLLAMA_DOC_V1 -->
+
+## Phase 3: Contextual Definitions (Ollama)
+
+This phase integrates a local Ollama Large Language Model (LLM) to generate contextual definitions for keywords extracted in Phase 2. This process is handled asynchronously via a new Celery task.
+
+### New Dependencies (Phase 3)
+
+-   `requests`: For making HTTP API calls to the local Ollama server. (Ensure this is in `requirements.txt`).
+
+### Ollama Setup & Configuration
+
+1.  **Install Ollama**: If you haven't already, download and install Ollama from [ollama.ai](https://ollama.ai/).
+2.  **Download an LLM Model**: You need to pull a model that Ollama will serve. The application is configured to use a model specified by an environment variable, defaulting to `deepseek-coder:6.7b`. You can use another model like `deepseek-r1:8b` (as per user suggestion) or others compatible with Ollama.
+    -   Pull a model using: `ollama pull <model_name_tag>` (e.g., `ollama pull deepseek-coder:6.7b` or `ollama pull deepseek-r1:8b`).
+3.  **Ensure Ollama is Running**: The Ollama application/server must be running locally. By default, it serves at `http://localhost:11434`.
+4.  **Environment Variables**:
+    -   `OLLAMA_HOST`: Set this if your Ollama instance is not at the default host/port. Defaults to `http://localhost:11434`.
+    -   `OLLAMA_MODEL`: Specify the Ollama model tag to be used for generating definitions. Defaults to `deepseek-coder:6.7b`. Example: `export OLLAMA_MODEL=deepseek-r1:8b`.
+
+### Celery Definition Generation Task (`generate_definitions_for_session_task`)
+
+A new Celery task, `generate_definitions_for_session_task`, orchestrates the definition generation:
+1.  It's triggered after NLP processing (keyword extraction, etc.) for a session is complete.
+2.  It iterates through each keyword found in the session and each of its identified contexts (transcript chunks).
+3.  For every keyword-context pair, it calls the `project.services.ollama_service.generate_definition` function.
+4.  This service function constructs a prompt and makes a request to the configured Ollama model via the `/api/chat` endpoint.
+5.  If a definition is successfully generated:
+    a.  A new `Definition` document is created in MongoDB. This document stores the keyword ID, the context preview (text snippet provided to the LLM), the generated definition text, the LLM model identifier, and a creation timestamp.
+    b.  The ID of this new definition is added to the `definition_ids` list within the corresponding `Keyword` document in MongoDB.
+6.  The `Session` document's `definition_status` field is updated to track progress (e.g., "defs_processing", "defs_completed", "defs_failed").
+
+### Updated MongoDB Schemas (Pydantic - `project/mongodb_schemas.py`)
+
+Key changes for definition generation:
+-   **`DefinitionSchema`**:
+    -   `context_preview: str`: Stores the specific text context provided to the LLM for this definition.
+    -   `llm_model_identifier: str`: Stores the name of the Ollama model used (e.g., "ollama/deepseek-coder:6.7b").
+    -   `created_at` now uses `default_factory=datetime.utcnow`.
+-   **`KeywordSchema`**: The `definition_ids: List[str]` field links to the generated definitions.
+-   **`SessionSchema`**: Added `definition_status: Optional[str]` to track this phase.
+
+### Updated GraphQL Schema (`project/schema.py`)
+
+The GraphQL API now exposes these new fields related to definitions:
+-   **`Definition` Type**:
+    -   `contextPreview: String!`
+    -   `definitionText: String!`
+    -   `createdAt: DateTime!`
+    -   `llmModelIdentifier: String!`
+-   **`Keyword` Type**: The existing `definitions: [Definition!]\` field now resolves the contextually generated definitions.
+-   **`Session` Type**: Added `definitionStatus: String`.
+
+**Example Query for Definitions:**
+```graphql
+query GetKeywordWithDefinitions($slug: String!) {
+  keywordBySlug(slug: $slug) { # Assuming slug is globally unique for simplicity
+    id
+    term
+    definitions {
+      id
+      contextPreview
+      definitionText
+      llmModelIdentifier
+      createdAt
+    }
+    # You can also query contexts here to see where the keyword appeared
+    contexts {
+        transcriptChunkId
+        contextPreview
+    }
+  }
+}
+
+query GetSessionWithDefinitionStatus($id: ID!) {
+  session(id: $id) {
+    id
+    title
+    definitionStatus
+    keywords { # To see keywords and then their definitions
+        term
+        definitions {
+            id
+            definitionText
+            contextPreview
+        }
+    }
+  }
+}
+```
+
 <!-- PHASE2_NLP_DOC_V1 -->
 
 ## Phase 2: NLP & Keyword Processing

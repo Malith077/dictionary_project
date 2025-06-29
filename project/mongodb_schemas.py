@@ -2,113 +2,110 @@ from typing import List, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field, validator
 
-# Pydantic models define the expected structure for MongoDB documents.
+# --- Pydantic Models for MongoDB Document Schemas ---
 
-class KeywordSpanSchema(BaseModel): # Unchanged from previous version for now
+class KeywordSpanSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the keyword span")
     keyword_id: str = Field(..., description="Identifier of the associated keyword")
     startIndex: int = Field(..., description="Start index of the keyword in the content")
     endIndex: int = Field(..., description="End index of the keyword in the content")
 
-class TranscriptChunkSchema(BaseModel): # Updated
+class TranscriptChunkSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the transcript chunk")
     session_id: str = Field(..., description="Identifier of the parent session")
     content: str = Field(..., description="Text content of the transcript chunk")
-    start_time: Optional[float] = Field(None, description="Start time of the chunk in seconds from the beginning of the audio")
-    end_time: Optional[float] = Field(None, description="End time of the chunk in seconds from the beginning of the audio")
-    keywordSpans: List[KeywordSpanSchema] = Field(default_factory=list, description="List of keyword spans within this chunk (if using detailed span mapping)")
-    # Note: KeywordSpans might become less relevant if keywords are linked via KeywordSchema.contexts to the chunk itself.
-    # For now, keeping it for potential fine-grained highlighting within a chunk.
+    start_time: Optional[float] = Field(None, description="Start time of the chunk in seconds")
+    end_time: Optional[float] = Field(None, description="End time of the chunk in seconds")
+    keywordSpans: List[KeywordSpanSchema] = Field(default_factory=list, description="List of keyword spans within this chunk")
 
-class KeywordContextSchema(BaseModel): # New Schema
+class KeywordContextSchema(BaseModel):
     transcript_chunk_id: str = Field(..., description="ID of the TranscriptChunk where the keyword appears")
-    # embedding_id: Optional[str] = Field(None, description="ID of the embedding in ChromaDB for this chunk's context (optional here, might be managed separately)")
-    context_preview: str = Field(..., description="A snippet of the context (e.g., the chunk content or a summary)")
-    # start_time_in_chunk: Optional[float] = Field(None, description="Relative start time of keyword in this chunk (if available)")
-    # end_time_in_chunk: Optional[float] = Field(None, description="Relative end time of keyword in this chunk (if available)")
-    # For simplicity, the chunk's overall start_time (from TranscriptChunkSchema, referenced by transcript_chunk_id) can serve as context timestamp.
+    context_preview: str = Field(..., description="A snippet of the context text used for definition generation")
+    # start_time_in_chunk, end_time_in_chunk could be added if keyword extractors provide precise offsets within the preview
 
-class DefinitionSchema(BaseModel): # Unchanged for now
+class DefinitionSchema(BaseModel): # Updated for Phase 3 clarity
     id: str = Field(..., description="Unique identifier for the definition")
-    keyword_id: str = Field(..., description="Identifier of the associated keyword")
-    contextSummary: str = Field(..., description="Summary of the context in which the keyword was defined") # This might relate to KeywordContextSchema later
-    definitionText: str = Field(..., description="The generated definition text")
-    createdAt: datetime = Field(..., description="Timestamp of when the definition was created")
-    modelUsed: str = Field(..., description="Identifier of the LLM model used to generate the definition")
+    keyword_id: str = Field(..., description="Identifier of the associated keyword (links to KeywordSchema)")
+    # This context_preview is the actual text snippet that was provided to the LLM
+    # to generate this specific definition.
+    context_preview: str = Field(..., description="The text context provided to the LLM for generating this definition")
+    definition_text: str = Field(..., description="The generated definition text from the LLM")
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of when the definition was created")
+    llm_model_identifier: str = Field(..., description="Identifier of the LLM model used (e.g., 'ollama/deepseek-coder:6.7b')") # Renamed to avoid Pydantic conflict
 
-class KeywordSchema(BaseModel): # Updated
+class KeywordSchema(BaseModel):
     id: str = Field(..., description="Unique identifier for the keyword")
     term: str = Field(..., description="The keyword term itself")
-    slug: str = Field(..., description="URL-safe unique slug for the keyword (generated from term)")
+    slug: str = Field(..., description="URL-safe unique slug for the keyword")
     session_id: str = Field(..., description="Identifier of the session where this keyword was identified")
-    contexts: List[KeywordContextSchema] = Field(default_factory=list, description="List of contexts where this keyword appears")
-    definition_ids: List[str] = Field(default_factory=list, description="List of IDs of definitions for this keyword")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of keyword creation")
-    updated_at: Optional[datetime] = Field(None, description="Timestamp of last update to keyword contexts or definitions")
+    contexts: List[KeywordContextSchema] = Field(default_factory=list, description="List of contexts (transcript chunks) where this keyword appears")
+    definition_ids: List[str] = Field(default_factory=list, description="List of IDs of definitions generated for this keyword (links to DefinitionSchema)")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime] = Field(None)
 
     @validator('slug', pre=True, always=True)
     def generate_slug(cls, v, values):
-        # Basic slug generation from term if slug is not provided
-        # A more robust slugifier might be needed (e.g., python-slugify)
         if v is None and 'term' in values:
             term_value = values['term']
-            # Simple slug: lowercase, replace spaces with hyphens, remove special chars
             slug_candidate = term_value.lower().replace(' ', '-')
             slug_candidate = ''.join(e for e in slug_candidate if e.isalnum() or e == '-')
             return slug_candidate
         return v
 
-
-class SessionSchema(BaseModel): # Updated
+class SessionSchema(BaseModel): # Updated for Phase 3
     id: str = Field(..., description="Unique identifier for the session")
-    title: Optional[str] = Field(None, description="Optional title for the session")
-    source: str = Field(..., description="Source of the session (e.g., 'youtube', 'mic')")
-    createdAt: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of when the session was created")
-    summary: Optional[str] = Field(None, description="Optional summary of the session")
+    title: Optional[str] = Field(None)
+    source: str = Field(...) # e.g., 'youtube', 'mic'
+    createdAt: datetime = Field(default_factory=datetime.utcnow)
+    summary: Optional[str] = Field(None)
 
-    youtube_url: Optional[str] = Field(None, description="URL of the YouTube video, if applicable")
-    transcription_status: Optional[str] = Field(None, description="Status of transcription (e.g., pending, processing, completed, failed)")
-    full_transcript_text: Optional[str] = Field(None, description="The full transcribed text, if available")
+    youtube_url: Optional[str] = Field(None)
+    transcription_status: Optional[str] = Field(None) # e.g., pending, processing, completed, failed
+    full_transcript_text: Optional[str] = Field(None)
 
-    nlp_status: Optional[str] = Field(None, description="Status of NLP processing (e.g., pending, nlp_processing, nlp_completed, nlp_failed)")
+    nlp_status: Optional[str] = Field(None) # e.g., pending, nlp_processing, nlp_completed, nlp_failed
+    definition_status: Optional[str] = Field(None, description="Status of contextual definition generation (e.g., pending, defs_processing, defs_completed, defs_failed)")
 
-    transcript_ids: List[str] = Field(default_factory=list, description="List of IDs of transcript chunks for this session")
-    keyword_ids: List[str] = Field(default_factory=list, description="List of IDs of keywords identified in this session (overall session keywords, distinct from chunk-specific keyword contexts)")
+    transcript_ids: List[str] = Field(default_factory=list)
+    keyword_ids: List[str] = Field(default_factory=list) # Distinct keyword IDs for the session
 
 
 if __name__ == "__main__":
-    # Example for KeywordSchema with new context
-    kw_context_data = {
-        "transcript_chunk_id": "chunk123",
-        "context_preview": "This chunk talks about blockchain technology and its impact."
-    }
-    kw_data = {
-        "id": "kw1",
-        "term": "blockchain technology",
-        "session_id": "sess456",
-        "contexts": [kw_context_data],
-        # slug will be auto-generated if not provided
+    # Example for DefinitionSchema
+    def_data = {
+        "id": "def123", "keyword_id": "kw1",
+        "context_preview": "The context snippet given to the LLM...",
+        "definition_text": "A concise definition generated by the LLM.",
+        "model_used": "ollama/deepseek-coder:6.7b" # Keep example data key as 'model_used' if using alias
+        # createdAt will use default_factory
     }
     try:
-        kw_instance = KeywordSchema(**kw_data)
-        print("Keyword instance with context created successfully:")
-        print(kw_instance.model_dump_json(indent=2))
-        assert kw_instance.slug == "blockchain-technology" # From auto-slugify
+        # If using alias, Pydantic v2 expects the alias name for instantiation if populate_by_name=True in Config
+        # For direct instantiation with Python name, use llm_model_identifier
+        def_instance_data_py_names = {
+            "id": "def123", "keyword_id": "kw1",
+            "context_preview": "The context snippet given to the LLM...",
+            "definition_text": "A concise definition generated by the LLM.",
+            "llm_model_identifier": "ollama/deepseek-coder:6.7b"
+            # createdAt will use default_factory
+        }
+        def_instance = DefinitionSchema(**def_instance_data_py_names)
+        print("Definition instance created successfully:")
+        print(def_instance.model_dump_json(indent=2))
     except Exception as e:
-        print(f"Error creating KeywordSchema instance: {e}")
+        print(f"Error creating DefinitionSchema instance: {e}")
 
-    # Example for SessionSchema with new nlp_status
+    # Example for SessionSchema with new definition_status
     sess_data = {
-        "id": "sess789",
-        "source": "youtube",
+        "id": "sess789", "source": "youtube",
         "youtube_url": "http://youtube.com/...",
         "transcription_status": "completed",
-        "nlp_status": "pending"
-        # Note: createdAt will be auto-filled by default_factory
+        "nlp_status": "nlp_completed",
+        "definition_status": "pending"
     }
     try:
         sess_instance = SessionSchema(**sess_data)
-        print("\nSession instance with nlp_status created successfully:")
+        print("\nSession instance with definition_status created successfully:")
         print(sess_instance.model_dump_json(indent=2))
     except Exception as e:
         print(f"Error creating SessionSchema instance: {e}")
